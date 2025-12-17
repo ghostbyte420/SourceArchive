@@ -3,7 +3,7 @@
 ## Installation
 
 ### Prerequisites
-- [Praxiis' ULTIMA LIVE](https://www.servuo.com/) is required.
+- [Praxiis' ULTIMA LIVE](https://github.com/ghostbyte420/SourceArchive/tree/main/Praxiiz/UltimaLive) is required.
 
 ### Steps
 1. **Add Blackmap Files**
