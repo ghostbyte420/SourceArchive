@@ -1,0 +1,133 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
+
+namespace Transitions
+{
+    public class XMLgenerator
+    {
+        
+        public static string? InitialLandTypeId { get; set; }
+        private static readonly List<string> AllowedAlphaTypes = new List<string> { "VL", "VR", "DR", "DL", "VV", "LL" };
+
+        
+
+        public void GenerateXML(List<string> texture1FilePaths, List<string> texture2FilePaths, List<string> alphaImageFileNames, string outputPath)
+        {
+            XDocument xmlDocument = new XDocument(new XElement("transition"));
+
+            string currentID = InitialLandTypeId; // Déclaré en dehors de l'appel à GenerateXML
+
+            GenerateBrush(xmlDocument, "Textures 1", "0001", ref currentID, texture1FilePaths, alphaImageFileNames.Where(x => x.Contains("V1") || x.Contains("L1") || x.Contains("R1")).ToList());
+            GenerateBrush(xmlDocument, "Textures 2", "0002", ref currentID, texture2FilePaths, alphaImageFileNames.Where(x => x.Contains("V2") || x.Contains("L2") || x.Contains("R2")).ToList());
+
+
+
+            string xmlFilePath = Path.Combine(outputPath, "transition.xml");
+            xmlDocument.Save(xmlFilePath);
+
+            Console.WriteLine($"Le fichier XML a été généré avec succès : {xmlFilePath}");
+        }
+
+        private static void GenerateBrush(XDocument xmlDocument, string brushName, string brushId, ref string currentID, List<string> textureFilePaths, List<string> alphaImageFileNames)
+        {
+            // Vérifiez si xmlDocument.Root est null
+            if (xmlDocument.Root != null)
+            {
+                XElement brushElement = new XElement("Brush",
+                    new XAttribute("Id", brushId),
+                    new XAttribute("Name", brushName));
+
+                foreach (string filePath in textureFilePaths)
+                {
+                    string textureName = Path.GetFileNameWithoutExtension(filePath);
+                    string hexValue = ExtractHexNumber(textureName);
+
+                    XElement landElement = new XElement("Land",
+                        new XAttribute("ID", $"{hexValue}")); // Ajouter le préfixe "0x"
+                    brushElement.Add(landElement);
+                }
+
+                string nextID = IncrementHexID(currentID); // Incrémentez l'ID actuel
+                Console.WriteLine($"ID actuel : {currentID}, ID suivant : {nextID}");
+
+                XElement edgeElement = new XElement("Edge", new XAttribute("To", brushId == "0001" ? "0002" : "0001"));
+                foreach (string alphaFileName in alphaImageFileNames)
+                {
+                    string alphaName = Path.GetFileNameWithoutExtension(alphaFileName);
+                    string alphaType = ExtractAlphaType(alphaName);
+                    string hexValue = ExtractHexNumber(alphaName);
+
+                    // Utilisez l'ID actuel et incrémentez-le
+                    XElement landElement = new XElement("Land",
+                        new XAttribute("Type", alphaType),
+                        new XAttribute("ID", $"0x{currentID}")); // Ajouter le préfixe "0x"
+
+                    edgeElement.Add(landElement);
+
+                    // Incrémentez l'ID pour le prochain Land
+                    currentID = IncrementHexID(currentID);
+                }
+
+                brushElement.Add(edgeElement);
+                xmlDocument.Root.Add(brushElement);
+            }
+            else
+            {
+                // Gérer le cas où xmlDocument.Root est null, selon la logique de votre application
+                Console.WriteLine("Attention : xmlDocument.Root est null. Vérifiez le chargement correct du document XML.");
+            }
+        }
+
+
+
+
+
+
+        private static string ExtractHexNumber(string fileName)
+        {
+            return Regex.Match(fileName, @"\b0x[0-9a-fA-F]+\b").Value;
+        }
+
+        private static string ExtractAlphaType(string fileName)
+        {
+            string alphaType = fileName.Substring(0, 2);
+            return AllowedAlphaTypes.Contains(alphaType) ? alphaType : "Unknown";
+        }
+        private static string IncrementHexID(string currentID)
+        {
+            // Convertir l'ID actuel en entier
+            int intValue = Convert.ToInt32(currentID, 16);
+
+            // Incrémenter l'entier de 1
+            intValue++;
+
+            // Convertir cet entier en représentation hexadécimale avec un format spécifique de 4 chiffres
+            string nextHexID = intValue.ToString("X4");
+
+            return nextHexID;
+        }
+
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
