@@ -1,0 +1,1987 @@
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\CreateProcess.cs ===
+
+using System;
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+using System.Security;
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.ConstrainedExecution;
+using System.Security.Permissions;
+using System.Text;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Diagnostics;
+
+namespace MasterControlProgram
+{
+    internal sealed class OrdinalCaseInsensitiveComparer : IComparer
+    {
+        public static readonly OrdinalCaseInsensitiveComparer Default = new OrdinalCaseInsensitiveComparer();
+        public int Compare(object a, object b)
+        {
+            string str = a as string;
+            string str2 = b as string;
+            if ((str != null) && (str2 != null))
+            {
+                return string.CompareOrdinal(str.ToUpperInvariant(), str2.ToUpperInvariant());
+            }
+            return Comparer.Default.Compare(a, b);
+        }
+    }
+
+    [SuppressUnmanagedCodeSecurity]
+    static partial class WINAPI
+    {
+        private static bool IsNt
+        {
+            get { return (Environment.OSVersion.Platform == PlatformID.Win32NT); }
+        }
+
+
+        public static byte[] EnvironmentToByteArray(StringDictionary sd, bool unicode)
+        {
+            string[] array = new string[sd.Count];
+            byte[] bytes = null;
+            sd.Keys.CopyTo(array, 0);
+            string[] strArray2 = new string[sd.Count];
+            sd.Values.CopyTo(strArray2, 0);
+            Array.Sort(array, strArray2, OrdinalCaseInsensitiveComparer.Default);
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < sd.Count; i++)
+            {
+                builder.Append(array[i]);
+                builder.Append('=');
+                builder.Append(strArray2[i]);
+                builder.Append('\0');
+            }
+            builder.Append('\0');
+            if (unicode)
+            {
+                bytes = Encoding.Unicode.GetBytes(builder.ToString());
+            }
+            else
+            {
+                bytes = Encoding.Default.GetBytes(builder.ToString());
+            }
+            if (bytes.Length > 0xFFFF)
+            {
+                throw new InvalidOperationException("EnvironmentBlockTooLong");
+            }
+            return bytes;
+        }
+
+        private static StringBuilder BuildCommandLine(string executableFileName, string arguments)
+        {
+            StringBuilder sb = new StringBuilder();
+            executableFileName = executableFileName.Trim();
+            bool ready = executableFileName.StartsWith("\"", StringComparison.Ordinal) && executableFileName.EndsWith("\"", StringComparison.Ordinal);
+            if (!ready)
+            {
+                sb.Append("\"");
+            }
+            sb.Append(executableFileName);
+            if (!ready)
+            {
+                sb.Append("\"");
+            }
+            if (!string.IsNullOrEmpty(arguments))
+            {
+                sb.Append(" ");
+                sb.Append(arguments);
+            }
+            return sb;
+        }
+
+        // I think I jacked a lot of this code from mscorlib, I don't remember....
+        public static bool CreateProcess(ProcessStartInfo startInfo, bool createSuspended, out SafeProcessHandle process, out SafeThreadHandle thread, out int processID, out int threadID)
+        {
+            StringBuilder cmdLine = BuildCommandLine(startInfo.FileName, startInfo.Arguments);
+            STARTUPINFO lpStartupInfo = new STARTUPINFO();
+            PROCESS_INFORMATION lpProcessInformation = new PROCESS_INFORMATION();
+            SafeProcessHandle processHandle = new SafeProcessHandle();
+            SafeThreadHandle threadHandle = new SafeThreadHandle();
+            GCHandle environment = new GCHandle();
+            uint creationFlags = 0;
+            bool success;
+
+            creationFlags = CREATE_DEFAULT_ERROR_MODE | CREATE_PRESERVE_CODE_AUTHZ_LEVEL;
+
+
+            if (createSuspended)
+                creationFlags |= CREATE_SUSPENDED;
+
+            if (startInfo.CreateNoWindow)
+                creationFlags |= CREATE_NO_WINDOW;
+
+            IntPtr pinnedEnvironment = IntPtr.Zero;
+
+            if (startInfo.EnvironmentVariables != null)
+            {
+                bool unicode = false;
+                if (IsNt)
+                {
+                    creationFlags |= CREATE_UNICODE_ENVIRONMENT;
+                    unicode = true;
+                }
+                environment = GCHandle.Alloc(EnvironmentToByteArray(startInfo.EnvironmentVariables, unicode), GCHandleType.Pinned);
+                pinnedEnvironment = environment.AddrOfPinnedObject();
+            }
+
+            string workingDirectory = startInfo.WorkingDirectory;
+            if (workingDirectory == "")
+                workingDirectory = Environment.CurrentDirectory;
+
+            success = CreateProcess(null, cmdLine, null, null, false, creationFlags, pinnedEnvironment, workingDirectory, lpStartupInfo, lpProcessInformation);
+
+            if ((lpProcessInformation.hProcess != IntPtr.Zero) && (lpProcessInformation.hProcess.ToInt32() != INVALID_HANDLE_VALUE))
+                processHandle.InitialSetHandle(lpProcessInformation.hProcess);
+
+            if ((lpProcessInformation.hThread != IntPtr.Zero) && (lpProcessInformation.hThread.ToInt32() != INVALID_HANDLE_VALUE))
+                threadHandle.InitialSetHandle(lpProcessInformation.hThread);
+
+            if (environment.IsAllocated)
+                environment.Free();
+
+            lpStartupInfo.Dispose();
+
+            if (success && !processHandle.IsInvalid && !threadHandle.IsInvalid)
+            {
+                process = processHandle;
+                thread = threadHandle;
+                processID = (int)lpProcessInformation.dwProcessId;
+                threadID = (int)lpProcessInformation.dwThreadId;
+                return true;
+            }
+
+            process = null;
+            thread = null;
+            processID = 0;
+            threadID = 0;
+            return false;
+        }
+    }
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\IPC.cs ===
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Reflection;
+using System.Reflection.Emit;
+using System.IO;
+
+namespace MasterControlProgram
+{
+    unsafe class IPC
+    {
+        public delegate void MemCpyFunction(void* des, void* src, uint len);
+        public static readonly MemCpyFunction MemCpy;
+
+        static IntPtr inFileMap = IntPtr.Zero;
+        static IntPtr outFileMap = IntPtr.Zero;
+        static IntPtr inSemaphore = IntPtr.Zero;
+        static IntPtr outSemaphore = IntPtr.Zero;
+        static IntPtr inputView = IntPtr.Zero;
+        static IntPtr outputView = IntPtr.Zero;
+        static volatile bool outputContinue = true;
+        static volatile bool loggingEnabled = false;
+        static byte* input;
+        static byte* output;
+        static Thread outputThread;
+        public static volatile bool IncomingFilterDemo = false;
+        public static volatile bool OutgoingFilterDemo = false;
+        static uint *inputLock;
+        static uint *outputLock;
+
+        public static bool LoggingEnabled
+        {
+            get { return loggingEnabled; }
+            set { loggingEnabled = value; }
+        }
+
+        static IPC()
+        {
+            // Fast managed memcpy using IL opcodes
+            DynamicMethod dm = new DynamicMethod("MemCpy", typeof(void), new[] { typeof(void*), typeof(void*), typeof(uint) }, typeof(Program));
+            ILGenerator i = dm.GetILGenerator();
+            i.Emit(OpCodes.Ldarg_0);
+            i.Emit(OpCodes.Ldarg_1);
+            i.Emit(OpCodes.Ldarg_2);
+            i.Emit(OpCodes.Cpblk);
+            i.Emit(OpCodes.Ret);
+            MemCpy = (MemCpyFunction)dm.CreateDelegate(typeof(MemCpyFunction));
+        }
+
+        static void ObtainInputBufferAccess()
+        {
+            // 0 = free for write access, 1 = in use, 2 = free for read access
+            int bufferLock = *(int*)input;
+            while (0 != WINAPI.InterlockedCompareExchange(inputLock, 1, 0))
+            {
+                Thread.Sleep(1);
+            }
+        }
+
+        static void ReleaseInputBuffer()
+        {
+            // 0 = free for write access, 1 = in use, 2 = free for read access
+            WINAPI.InterlockedExchange(inputLock, 2);
+            // tell MasterControl.dll that it has data to grab
+            WINAPI.ReleaseSemaphore(inSemaphore, 1, IntPtr.Zero);
+        }
+
+        public static void ExecuteMacroType1(uint arg1, ushort arg2)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            /* Each MessageType will have a struct associated with it which
+             * describes the data layout for that specific message.  The only
+             * exception is for messages which only have one field (i.e. raw data)
+             * like the incoming and outgoing packet messages for instance. */
+
+            /* The layout for the Type2Macro message type is:
+             * DWORD arg1 (first argument for macro, anyone who remembers old version of EUO will remember...)
+             * WORD arg2 */
+
+            /* We're sending commands on the input buffer because the buffers are named
+             * from the point of view of MasterControl.dll.  MasterControl receives commands on the input buffer */
+
+            Type1MacroStruct m = new Type1MacroStruct();
+            m.arg1 = arg1;
+            m.arg2 = arg2;
+            SendIpcMessage(IncomingMessageType.Type1Macro, &m, (uint)sizeof(Type1MacroStruct));
+        }
+
+        public static void CallPathfindFunction(ushort x, ushort y, ushort z)
+        {
+            PathfindStruct p;
+            p.x = x;
+            p.y = y;
+            p.z = z;
+            SendIpcMessage(IncomingMessageType.Pathfind, &p, (uint)sizeof(PathfindStruct));
+        }
+
+        public static void CallGumpFunction(uint gumpHandle, uint function)
+        {
+            CallGumpFunctionStruct cg;
+            cg.functionIndex = function;
+            cg.gumpHandle = gumpHandle;
+            SendIpcMessage(IncomingMessageType.CallGumpFunction, &cg, (uint)sizeof(CallGumpFunctionStruct));
+        }
+
+        public static void SetLoginServer(uint server, ushort port)
+        {
+            LoginServerStruct l;
+            l.server = server;
+            l.port = port;
+            SendIpcMessage(IncomingMessageType.SetLoginServer, &l, (uint)sizeof(LoginServerStruct));
+        }
+
+        public static void ExecuteMacroType2(uint arg1, ushort arg2, string arg3)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            /* Each MessageType will have a struct associated with it which
+             * describes the data layout for that specific message.  The only
+             * exception is for messages which only have one field (i.e. raw data)
+             * like the incoming and outgoing packet messages for instance. */
+
+            /* The layout for the Type2Macro message type is:
+             * DWORD arg1 (first argument for macro, anyone who remembers old version of EUO will remember...)
+             * WORD arg2 second macro argument
+             * DWORD text buffer len (length of the following text buffer)
+             * BYTE[] text buffer (little endian unicode string) */
+
+            /* There isn't really any 'clean' way to do this one in managed code,
+             * but you only have to code it once: */
+
+            ObtainInputBufferAccess();
+            // Please NULL terminate your strings
+            byte[] arg3Bytes = UnicodeEncoding.Unicode.GetBytes(arg3 + "\0");
+            Type2MacroStruct m = new Type2MacroStruct();
+            m.arg1 = arg1;
+            m.arg2 = arg2;
+            m.textLen = (uint)arg3Bytes.Length;
+            input[4] = (byte)IncomingMessageType.Type2Macro;
+            int structLen = 10 + arg3Bytes.Length;
+            *(int*)&input[5] = structLen;
+            MemCpy(&input[9], &m, 10);
+            fixed (byte* text = &arg3Bytes[0])
+                MemCpy(&input[19], text, (uint)arg3Bytes.Length);
+            ReleaseInputBuffer();
+        }
+
+        public static void AddIncomingPacketFilter(byte packet)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)IncomingMessageType.AddIncomingPacketFilter;
+                *(uint*)&input[5] = 1;
+                input[9] = packet;
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        public static void RemoveIncomingPacketFilter(byte packet)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)IncomingMessageType.RemoveIncomingPacketFilter;
+                *(uint*)&input[5] = 1;
+                input[9] = packet;
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        public static void AddOutgoingPacketFilter(byte packet)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)IncomingMessageType.AddOutgoingPacketFilter;
+                *(uint*)&input[5] = 1;
+                input[9] = packet;
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        public static void RemoveOutgoingPacketFilter(byte packet)
+        {
+            /* layout of IPC buffer:
+             * DWORD lock (used for thread safe access to the buffer)
+             * BYTE MessageType (either IncomingMessageType or OutgoingMessageType
+             * DWORD len (the length of the following raw byte buffer
+             * BYTE[] ^len bytes of raw data */
+
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)IncomingMessageType.RemoveOutgoingPacketFilter;
+                *(uint*)&input[5] = 1;
+                input[9] = packet;
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        static void PressEnterToContinue()
+        {
+            Console.WriteLine("Press <Enter> to continue...");
+            Console.ReadLine();
+        }
+
+        public static void SendIpcMessage(IncomingMessageType m)
+        {
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)m;
+                *(uint*)&input[5] = 0;
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        public static void SendIpcMessage(IncomingMessageType m, byte[] rawMessage)
+        {
+            fixed (byte* raw = &rawMessage[0])
+            {
+                SendIpcMessage(m, raw, (uint)rawMessage.Length);
+            }
+        }
+
+        public static void SendIpcMessage(IncomingMessageType m, void* rawMessage, uint len)
+        {
+            ObtainInputBufferAccess();
+            try
+            {
+                input[4] = (byte)m;
+                *(uint*)&input[5] = len;
+                MemCpy(&input[9], rawMessage, len);
+            }
+            finally
+            {
+                ReleaseInputBuffer();
+            }
+        }
+
+        static void ProcessOutgoingPacket(byte[] buffer)
+        {
+            if (loggingEnabled)
+            {
+                Log.LogDataMessage(buffer, "Outgoing packet:\r\n");
+            }
+        }
+
+        static void ProcessIncomingPacket(byte[] buffer)
+        {
+            if (loggingEnabled)
+            {
+                Log.LogDataMessage(buffer, "Incoming packet:\r\n");
+            }
+        }
+
+        static void ProcessIncomingFilteredPacket(byte[] buffer)
+        {
+            if (loggingEnabled)
+            {
+                Log.LogDataMessage(buffer, "[!] Incoming packet DROPPED:\r\n");
+            }
+            //SendIpcMessage(IncomingMessageType.SendClientPacket, buffer);
+            if (IncomingFilterDemo == true && buffer[0] == 0x1C)
+            {
+                /* Here we demonstrate the modification of a filtered packet.
+                 * This packet was never received by the client because it's
+                 * been added to the packet blacklist.  However, it's still
+                 * sent to us for processing.  Packets sent by MasterControl.dll
+                 * aren't subject to the packet filters.  They also aren't sent back
+                 * over IPC. */
+
+                string newText = "Hey, hey, hey, it's the big Master Control Program everybody's talking about.\0";
+                byte[] newBytes = ASCIIEncoding.ASCII.GetBytes(newText);
+                byte[] newPacket = new byte[44 + newBytes.Length];
+                Buffer.BlockCopy(buffer, 0, newPacket, 0, 44);
+                Buffer.BlockCopy(newBytes, 0, newPacket, 44, newBytes.Length);
+                newPacket[1] = (byte)(newPacket.Length);
+                newPacket[2] = (byte)(newPacket.Length >> 8);
+                SendIpcMessage(IncomingMessageType.SendClientPacket, newPacket);
+                return;
+            }
+            if (IncomingFilterDemo == true && buffer[0] == 0xAE)
+            {
+                /* Here we demonstrate the modification of a filtered packet.
+                 * This packet was never received by the client because it's
+                 * been added to the packet blacklist.  However, it's still
+                 * sent to us for processing.  Packets sent by MasterControl.dll
+                 * aren't subject to the packet filters.  They also aren't sent back
+                 * over IPC. */
+
+                string newText = "Hey, hey, hey, it's the big Master Control Program everybody's talking about.\0";
+                byte[] newBytes = UnicodeEncoding.BigEndianUnicode.GetBytes(newText);
+                byte[] newPacket = new byte[48 + newBytes.Length];
+                Buffer.BlockCopy(buffer, 0, newPacket, 0, 48);
+                Buffer.BlockCopy(newBytes, 0, newPacket, 48, newBytes.Length);
+                if (buffer[9] == 0xC0)
+                    newPacket[9] = 0; // not sure if this is actually working as intended...but it might be!
+                newPacket[1] = (byte)(newPacket.Length);
+                newPacket[2] = (byte)(newPacket.Length >> 8);
+                SendIpcMessage(IncomingMessageType.SendClientPacket, newPacket);
+            }
+        }
+
+        static void ProcessOutgoingFilteredPacket(byte[] buffer)
+        {
+            if (loggingEnabled)
+            {
+                Log.LogDataMessage(buffer, "[!] Outgoing packet DROPPED:\r\n");
+            }
+
+            if (OutgoingFilterDemo == true && buffer[0] == 0xAD)
+            {
+                /* Here we demonstrate the modification of a filtered packet.
+                 * This packet was never sent by the client because it's
+                 * been added to the packet blacklist.  However, it's still
+                 * sent to us for processing.  Packets sent by MasterControl.dll
+                 * aren't subject to the packet filters.  They also aren't sent back
+                 * over IPC. */
+
+                /* In this example we change the text in outgoing speech
+                 * packets.  Everything is changed into l33t h4x0R sP34K.
+                 * We also use a hackish technique to turn keyword speech
+                 * packets into regular ascii speech packets. */
+
+                bool ascii = false;
+                if (buffer[3] == 0xC0) //keyword speech
+                    ascii = true;
+                string oldText;
+
+                if (ascii)
+                    oldText = ASCIIEncoding.ASCII.GetString(buffer, 15, buffer.Length - 15);
+                else
+                    oldText = UnicodeEncoding.BigEndianUnicode.GetString(buffer, 12, buffer.Length - 12);
+                string newText = l33t.w00t(oldText);
+                byte[] textBytes = UnicodeEncoding.BigEndianUnicode.GetBytes(newText);
+                byte[] packet = new byte[textBytes.Length + 12];
+                packet[0] = 0xAD;
+                packet[1] = (byte)(packet.Length);
+                packet[2] = (byte)(packet.Length >> 8);
+                Buffer.BlockCopy(buffer, 3, packet, 3, 9);
+                if (ascii)
+                    packet[3] = 0;
+                Buffer.BlockCopy(textBytes, 0, packet, 12, textBytes.Length);
+                SendIpcMessage(IncomingMessageType.SendServerPacket, packet);
+            }
+        }
+
+        static void ProcessOutput(OutgoingMessageType m, byte[] message)
+        {
+            switch (m)
+            {
+                case OutgoingMessageType.IncomingPacket:
+                    ProcessIncomingPacket(message);
+                    break;
+                case OutgoingMessageType.OutgoingPacket:
+                    ProcessOutgoingPacket(message);
+                    break;
+                case OutgoingMessageType.IncomingFilteredPacket:
+                    ProcessIncomingFilteredPacket(message);
+                    break;
+                case OutgoingMessageType.OutgoingFilteredPacket:
+                    ProcessOutgoingFilteredPacket(message);
+                    break;
+            }
+        }
+
+        static unsafe void OutputThreadProc()
+        {
+            while (outputContinue)
+            {
+                WINAPI.WaitForSingleObject(outSemaphore, WINAPI.INFINITE);
+                // 0 = free for write access, 1 = in use, 2 = free for read access
+                while (2 != WINAPI.InterlockedCompareExchange(outputLock, 1, 2))
+                    Thread.Sleep(1); // we should rarely (if ever) be here
+                IpcMessage m = output;
+                byte[] message = new byte[m.bufferLen];
+                try
+                {
+                    fixed (byte* buffer = &message[0])
+                        MemCpy(buffer, m.buffer, (uint)m.bufferLen);
+                }
+                finally { WINAPI.InterlockedExchange(outputLock, 0); }
+                // Avoid blocking this thread, as anything that makes this thread hang will also hang the client
+                ManagedThreadPool.QueueUserWorkItem(delegate { ProcessOutput((OutgoingMessageType)m.messageType, message); });
+            }
+        }
+
+        public static void Stop()
+        {
+            outputContinue = false;
+            if (outputThread != null)
+                outputThread.Abort();
+            if (outSemaphore != IntPtr.Zero)
+                WINAPI.ReleaseSemaphore(outSemaphore, 1, IntPtr.Zero);
+        }
+
+        public static bool Initialize(IntPtr hProcess)
+        {
+            Log.Initialize();
+            WINAPI.Inject(hProcess);
+
+            // This struct holds 4 handles we need to get everything up and running
+            IpcInfoStruct ipc = new IpcInfoStruct();
+            bool success = false;
+
+            // Keep trying until injection is complete
+            for (int x = 0; x < 50; x++)
+            {
+                if (WINAPI.GetIpcInfo(hProcess, ref ipc))
+                {
+                    success = true;
+                    break;
+                }
+                Thread.Sleep(100);
+            }
+
+            if (!success)
+                return false;
+
+            /* Getting the IPC system up and running is fairly simple.  Just duplicate a few handles and start a worker
+             * thread to process incoming IPC messages.  I use a lightweight, "lock free" system for safely sharing resources
+             * amongst different threads.  I use this technique in inline assembly in MasterControl.dll, C++ intriniscs in
+             * MasterControl.dll, and also here in C#.  It's based on atomic operations.  It's a fast simple system perfect
+             * for the low contention we'll see here.  Any contentions are dealt with via a Sleep(1).  A Sleep(0) or an empty loop
+             * could potentially give a faster response time (there shouldn't be any contention anyways), however it causes CPU usage
+             * to spike if for some reason the injector application or client.exe should close in the middle of an IPC operation. */
+
+            /* It's a 3 state locking system. 0 = free for write access, 1 = in use, 2 = free for read access.  A write must be followed by a read,
+             * which must be followed by a write, etc.  This ensures messages are delivered in order and removes the need for messy queues.
+             * In addition to that, signaling is used via semaphores.  This allows us to put the consumer threads to sleep until work is ready to 
+             * be done instead of having them try to acquire the lock all the time. */
+
+            IntPtr myProcess = WINAPI.OpenProcess(ProcessAccessFlags.All, false, WINAPI.GetCurrentProcessId());
+            if (myProcess == IntPtr.Zero)
+                return false;
+
+            if (!WINAPI.DuplicateHandle(hProcess, ipc.inSemaphore, myProcess, out inSemaphore, 0, false, DuplicateOptions.DUPLICATE_SAME_ACCESS))
+                return false;
+
+            if (!WINAPI.DuplicateHandle(hProcess, ipc.outSemaphore, myProcess, out outSemaphore, 0, false, DuplicateOptions.DUPLICATE_SAME_ACCESS))
+                return false;
+
+            if (!WINAPI.DuplicateHandle(hProcess, ipc.inFileMap, myProcess, out inFileMap, 0, false, DuplicateOptions.DUPLICATE_SAME_ACCESS))
+                return false;
+
+            if (!WINAPI.DuplicateHandle(hProcess, ipc.outFileMap, myProcess, out outFileMap, 0, false, DuplicateOptions.DUPLICATE_SAME_ACCESS))
+                return false;
+
+            inputView = WINAPI.MapViewOfFile(inFileMap, WINAPI.FILE_MAP_ALL_ACCESS, 0, 0, 0);
+            outputView = WINAPI.MapViewOfFile(outFileMap, WINAPI.FILE_MAP_ALL_ACCESS, 0, 0, 0);
+
+            if (inputView == IntPtr.Zero || outputView == IntPtr.Zero)
+                return false;
+
+            input = (byte*)inputView.ToPointer();
+            output = (byte*)outputView.ToPointer();
+
+            inputLock = (uint*)input;
+            outputLock = (uint*)output;
+
+            outputThread = new Thread(new ThreadStart(OutputThreadProc));
+            outputThread.Start();
+
+            return true;
+        }
+        ~IPC()
+        {
+            WINAPI.CloseHandle(inSemaphore);
+            WINAPI.CloseHandle(outSemaphore);
+            WINAPI.CloseHandle(inFileMap);
+            WINAPI.CloseHandle(outFileMap);
+            WINAPI.CloseHandle(inputView);
+            WINAPI.CloseHandle(outputView);
+        }
+    }
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\IpcStructs.cs ===
+
+using System;
+using System.Runtime.InteropServices;
+
+namespace MasterControlProgram
+{
+    enum OutgoingMessageType : byte
+    {
+        OutgoingMessage = 1,
+        IncomingPacket,
+        OutgoingPacket,
+        IncomingFilteredPacket,
+        OutgoingFilteredPacket
+    };
+
+    enum IncomingMessageType : byte
+    {
+        IncomingMessage = 1,
+        SendClientPacket,
+        SendServerPacket,
+        CallGumpFunction,
+        Pathfind,
+        Type1Macro, // 2 parameter
+        Type2Macro, // 3 parameter
+        AddIncomingPacketFilter,
+        RemoveIncomingPacketFilter,
+        AddOutgoingPacketFilter,
+        RemoveOutgoingPacketFilter,
+        PatchEncryption,
+        SetLoginServer
+    };
+
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct Type1MacroStruct
+    {
+        public uint arg1;
+        public ushort arg2;
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    unsafe struct Type2MacroStruct
+    {
+        public uint arg1;
+        public ushort arg2;
+        public uint textLen;
+        //public byte[] text; //unicode
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CallGumpFunctionStruct
+    {
+        public uint gumpHandle;    // Handle of gump to interact with. 0 = top gump
+        public uint functionIndex; // vTable function index to call.  Incorrect values -will- cause nasty client crashes.
+    };
+
+    [StructLayout(LayoutKind.Sequential, Pack = 2)]
+    struct PathfindStruct
+    {
+        public ushort x;
+        public ushort y;
+        public ushort z;
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct IpcInfoStruct
+    {
+        public IntPtr inFileMap;
+        public IntPtr outFileMap;
+        public IntPtr inSemaphore;
+        public IntPtr outSemaphore;
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LoginServerStruct 
+    {
+		public uint server;
+		public ushort port;
+	};
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    unsafe struct IpcMessage
+    {
+        public int bufferLock;
+        public byte messageType;
+        public int bufferLen;
+        public byte* buffer;
+
+        public static implicit operator IpcMessage(byte* source)
+        {
+            return new IpcMessage(source);
+        }
+
+        public IpcMessage(byte* source)
+        {
+            bufferLock = *(int*)&source[0];
+            messageType = source[4];
+            bufferLen = *(int*)&source[5];
+            buffer = source + 9;
+        }
+    };
+}
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\l33t.cs ===
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace MasterControlProgram
+{
+    static class l33t
+    {
+        static Random r = new Random(DateTime.Now.Millisecond);
+
+        static bool CoinFlip()
+        {
+            return (r.Next(0x1000) + 1) > 0x800;
+        }
+
+        public static string w00t(string input)  //so serious
+        {
+            StringBuilder s = new StringBuilder();
+            Random r = new Random(DateTime.Now.Millisecond);
+
+            foreach (char c in input)
+            {
+                switch (Char.ToLower(c))
+                {
+                    case 'a':
+                        s.Append('4');
+                        break;
+                    case 'b':
+                        s.Append('8');
+                        break;
+                    case 'e':
+                        s.Append('3');
+                        break;
+                    case 'g':
+                        s.Append('9');
+                        break;
+                    case 'i':
+                        s.Append('1');
+                        break;
+                    case 'o':
+                        s.Append('0');
+                        break;
+                    case 's':
+                        s.Append('5');
+                        break;
+                    case 't':
+                        s.Append('7');
+                        break;
+                    case 'z':
+                        if (CoinFlip()) s.Append('2');
+                        else s.Append('Z');
+                        break;
+                    default:
+                        if (CoinFlip()) s.Append(Char.ToLower(c));
+                        else s.Append(Char.ToUpper(c));
+                        break;
+                }
+            }
+            return s.ToString();
+        }
+
+    }
+}
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\Log.cs ===
+
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+namespace MasterControlProgram
+{
+    unsafe class Log
+    {
+        private static StreamWriter myFileWriter;
+        private static string myLogFileName;
+
+        internal static void Initialize()
+        {
+            StringBuilder sb = new StringBuilder(DateTime.Now.ToString());
+            char[] invalid = Path.GetInvalidFileNameChars();
+            for (int x = 0; x < sb.Length; x++)
+                for (int y = 0; y < invalid.Length; y++)
+                    if (sb[x] == invalid[y])
+                        sb[x] = '.';
+            sb.Append(".Log.txt");
+            Log.Initialize(sb.ToString());
+        }
+
+        internal static void Initialize(string logFileName)
+        {
+            myLogFileName = logFileName;
+            myFileWriter = File.CreateText(logFileName);
+            myFileWriter.AutoFlush = true;
+        }
+
+        private static string GetStringFromBytes(byte[] data)
+        {
+            fixed (byte* buffer = &data[0])
+            {
+                return GetStringFromBytes(buffer, data.Length);
+            }
+        }
+
+        private static string GetStringFromBytes(byte *data, int len)
+        {
+            StringBuilder sb = new StringBuilder(len * 5);
+            int index = 0;
+            bool prefix = true;
+
+            for (int x = 0; x < len; x++)
+            {
+                if (prefix)
+                {
+                    sb.AppendFormat("{0:X4}: ", x);
+                    prefix = false;
+                }
+                sb.AppendFormat("{0:X2} ", data[x]);
+                index++;
+                if (index == 16)
+                {
+                    sb.Append("| ");
+                    for (int y = x - 15; y <= x; y++)
+                    {
+                        if (data[y] > 31 && data[y] < 127)
+                            sb.Append((char)data[y]);
+                        else
+                            sb.Append('.');
+                    }
+                    if (x != len - 1) //don't leave extra newline
+                        sb.Append("\r\n");
+                    index = 0;
+                    prefix = true;
+                }
+            }
+            if (index != 0)
+            {
+                for (int x = index; x < 16; x++)
+                    sb.Append("   ");
+                sb.Append("| ");
+                for (int x = len - index; x < len; x++)
+                {
+                    if (data[x] > 31 && data[x] < 127)
+                        sb.Append((char)data[x]);
+                    else
+                        sb.Append('.');
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static string GetDateString()
+        {
+            return String.Format("[ ]========================[ {0} ]========================[ ]\r\n", DateTime.Now);
+        }
+
+        public static void LogDataMessage(byte *data, int len, string message)
+        {
+            string dataLen = String.Format("Length of data: {0} bytes (0x{1:X})\r\n", len, len);
+            string logMessage = String.Format("{0}{1}{2}{3}\r\n\r\n", GetDateString(), message, dataLen, GetStringFromBytes(data, len));
+            lock (myFileWriter) { myFileWriter.Write(logMessage); }
+        }
+
+        public static void LogDataMessage(byte[] data, string message)
+        {
+            fixed (byte* buffer = &data[0])
+            {
+                LogDataMessage(buffer, data.Length, message);
+            }
+        }
+
+        public static void LogMessage(string message)
+        {
+            string logMessage = String.Format("{0}{1}\r\n\r\n", GetDateString(), message);
+            lock (myFileWriter) { myFileWriter.Write(logMessage); }
+        }
+
+        public static void LogMessage(Exception exception)
+        {
+            string message = String.Format("{0}\r\n{1}\r\n{2}", exception.Message, exception.Source, exception.StackTrace);
+            string logMessage = String.Format("{0}Exception:\r\n{1}\r\n\r\n", GetDateString(), message);
+            lock (myFileWriter) { myFileWriter.Write(logMessage); }
+        }
+
+        public static void Dispose()
+        {
+            try
+            {
+                if (myFileWriter != null)
+                {
+                    myFileWriter.Flush();
+                    myFileWriter.Close();
+                    FileInfo fi = new FileInfo(myLogFileName);
+                    if (fi.Exists && fi.Length == 0)
+                        File.Delete(myLogFileName);
+                }
+            }
+            catch (ObjectDisposedException) { }
+        }
+
+        ~Log()
+        {
+            try
+            {
+                if (myFileWriter != null)
+                {
+                    myFileWriter.Flush();
+                    myFileWriter.Close();
+                    FileInfo fi = new FileInfo(myLogFileName);
+                    if (fi.Exists && fi.Length == 0)
+                        File.Delete(myLogFileName);
+                }
+            }
+            catch (ObjectDisposedException) { }
+        }
+    }
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\ManagedThreadPool.cs ===
+
+// Stephen Toub
+// stoub@microsoft.com
+// 
+// ManagedThreadPool.cs
+// ThreadPool written in 100% managed code.  Mimics the core functionality of
+// the System.Threading.ThreadPool class.
+//
+// HISTORY:
+// v1.0.1 - Disposes of items remaining in queue when the queue is emptied
+//		  - Catches errors thrown during execution of delegates
+//		  - Added reset to semaphore, called during empty queue
+//		  - Catches errors when unable to dequeue delegates
+// v1.0.0 - Original version
+// 
+// August 27, 2002
+// v1.0.1
+
+// http://www.gotdotnet.com/community/usersamples/Default.aspx?query=ManagedThreadPool
+
+#region Namespaces
+using System;
+using System.Threading;
+using System.Collections;
+#endregion
+
+namespace MasterControlProgram
+{
+	/// <summary>Implementation of Dijkstra's PV Semaphore based on the Monitor class.</summary>
+	public class Semaphore
+	{
+		#region Member Variables
+		/// <summary>The number of units alloted by this semaphore.</summary>
+		private int _count;
+		#endregion
+
+		#region Construction
+		/// <summary> Initialize the semaphore as a binary semaphore.</summary>
+		public Semaphore() : this(1) 
+		{
+		}
+
+		/// <summary> Initialize the semaphore as a counting semaphore.</summary>
+		/// <param name="count">Initial number of threads that can take out units from this semaphore.</param>
+		/// <exception cref="ArgumentException">Throws if the count argument is less than 1.</exception>
+		public Semaphore(int count) 
+		{
+			if (count < 0) throw new ArgumentException("Semaphore must have a count of at least 0.", "count");
+			_count = count;
+		}
+		#endregion
+
+		#region Synchronization Operations
+		/// <summary>V the semaphore (add 1 unit to it).</summary>
+		public void AddOne() { V(); }
+
+		/// <summary>P the semaphore (take out 1 unit from it).</summary>
+		public void WaitOne() { P(); }
+
+		/// <summary>P the semaphore (take out 1 unit from it).</summary>
+		public void P() 
+		{
+			// Lock so we can work in peace.  This works because lock is actually
+			// built around Monitor.
+			lock(this) 
+			{
+				// Wait until a unit becomes available.  We need to wait
+				// in a loop in case someone else wakes up before us.  This could
+				// happen if the Monitor.Pulse statements were changed to Monitor.PulseAll
+				// statements in order to introduce some randomness into the order
+				// in which threads are woken.
+				while(_count <= 0) Monitor.Wait(this, Timeout.Infinite);
+				_count--;
+			}
+		}
+
+		/// <summary>V the semaphore (add 1 unit to it).</summary>
+		public void V() 
+		{
+			// Lock so we can work in peace.  This works because lock is actually
+			// built around Monitor.
+			lock(this) 
+			{
+				// Release our hold on the unit of control.  Then tell everyone
+				// waiting on this object that there is a unit available.
+				_count++;
+				Monitor.Pulse(this);
+			}
+		}
+
+		/// <summary>Resets the semaphore to the specified count.  Should be used cautiously.</summary>
+		public void Reset(int count)
+		{
+			lock(this) { _count = count; }
+		}
+		#endregion
+	}
+
+	/// <summary>Managed thread pool.</summary>
+	public class ManagedThreadPool
+	{
+		#region Constants
+		/// <summary>Maximum number of threads the thread pool has at its disposal.</summary>
+		//private const int _maxWorkerThreads = 15;
+        private const int _maxWorkerThreads = 25;
+		#endregion
+
+		#region Member Variables
+		/// <summary>Queue of all the callbacks waiting to be executed.</summary>
+		static Queue _waitingCallbacks;
+		/// <summary>
+		/// Used to signal that a worker thread is needed for processing.  Note that multiple
+		/// threads may be needed simultaneously and as such we use a semaphore instead of
+		/// an auto reset event.
+		/// </summary>
+		static Semaphore _workerThreadNeeded;
+		/// <summary>List of all worker threads at the disposal of the thread pool.</summary>
+		static ArrayList _workerThreads;
+		/// <summary>Number of threads currently active.</summary>
+		static int _inUseThreads;
+		#endregion
+
+		#region Construction
+		/// <summary>Initialize the thread pool.</summary>
+		static ManagedThreadPool()
+		{
+			// Create our thread stores; we handle synchronization ourself
+			// as we may run into situtations where multiple operations need to be atomic.
+			// We keep track of the threads we've created just for good measure; not actually
+			// needed for any core functionality.
+			_waitingCallbacks = new Queue();
+			_workerThreads = new ArrayList();
+			_inUseThreads = 0;
+
+			// Create our "thread needed" event
+			_workerThreadNeeded = new Semaphore(0);
+			
+			// Create all of the worker threads
+			for(int i=0; i<_maxWorkerThreads; i++)
+			{
+				// Create a new thread and add it to the list of threads.
+				Thread newThread = new Thread(new ThreadStart(ProcessQueuedItems));
+				_workerThreads.Add(newThread);
+
+				// Configure the new thread and start it
+				newThread.Name = "ManagedPoolThread #" + i.ToString();
+				newThread.IsBackground = true;
+				newThread.Start();
+			}
+		}
+		#endregion
+
+		#region Public Methods
+		/// <summary>Queues a user work item to the thread pool.</summary>
+		/// <param name="callback">
+		/// A WaitCallback representing the delegate to invoke when the thread in the 
+		/// thread pool picks up the work item.
+		/// </param>
+		public static void QueueUserWorkItem(WaitCallback callback)
+		{
+			// Queue the delegate with no state
+			QueueUserWorkItem(callback, null);
+		}
+
+		/// <summary>Queues a user work item to the thread pool.</summary>
+		/// <param name="callback">
+		/// A WaitCallback representing the delegate to invoke when the thread in the 
+		/// thread pool picks up the work item.
+		/// </param>
+		/// <param name="state">
+		/// The object that is passed to the delegate when serviced from the thread pool.
+		/// </param>
+		public static void QueueUserWorkItem(WaitCallback callback, object state)
+		{
+			// Create a waiting callback that contains the delegate and its state.
+			// Add it to the processing queue, and signal that data is waiting.
+			WaitingCallback waiting = new WaitingCallback(callback, state);
+			lock(_waitingCallbacks.SyncRoot) { _waitingCallbacks.Enqueue(waiting); }
+			_workerThreadNeeded.AddOne();
+		}
+
+		/// <summary>Empties the work queue of any queued work items.</summary>
+		public static void EmptyQueue()
+		{
+			lock(_waitingCallbacks.SyncRoot) 
+			{ 
+				try 
+				{
+					// Try to dispose of all remaining state
+					foreach(object obj in _waitingCallbacks)
+					{
+						WaitingCallback callback = (WaitingCallback)obj;
+						if (callback.State is IDisposable) ((IDisposable)callback.State).Dispose();
+					}
+				} 
+				catch
+				{
+					// Make sure an error isn't thrown.
+				}
+
+				// Clear all waiting items and reset the number of worker threads currently needed
+				// to be 0 (there is nothing for threads to do)
+				_waitingCallbacks.Clear();
+				_workerThreadNeeded.Reset(0);
+			}
+		}
+		#endregion
+
+		#region Properties
+		/// <summary>Gets the number of threads at the disposal of the thread pool.</summary>
+		public static int MaxThreads { get { return _maxWorkerThreads; } }
+		/// <summary>Gets the number of currently active threads in the thread pool.</summary>
+		public static int ActiveThreads { get { return _inUseThreads; } }
+		/// <summary>Gets the number of callback delegates currently waiting in the thread pool.</summary>
+		public static int WaitingCallbacks { get { lock(_waitingCallbacks.SyncRoot) { return _waitingCallbacks.Count; } } }
+		#endregion
+
+		#region Thread Processing
+		/// <summary>A thread worker function that processes items from the work queue.</summary>
+		private static void ProcessQueuedItems()
+		{
+			// Process indefinitely
+			while(true)
+			{
+				// Get the next item in the queue.  If there is nothing there, go to sleep
+				// for a while until we're woken up when a callback is waiting.
+				WaitingCallback callback = null;
+				while (callback == null)
+				{
+					// Try to get the next callback available.  We need to lock on the 
+					// queue in order to make our count check and retrieval atomic.
+					lock(_waitingCallbacks.SyncRoot)
+					{
+						if (_waitingCallbacks.Count > 0)
+						{
+							try { callback = (WaitingCallback)_waitingCallbacks.Dequeue(); } 
+							catch{} // make sure not to fail here
+						}
+					}
+
+					// If we can't get one, go to sleep.
+					if (callback == null) _workerThreadNeeded.WaitOne();
+				}
+
+				// We now have a callback.  Execute it.  Make sure to accurately
+				// record how many callbacks are currently executing.
+				try 
+				{
+					Interlocked.Increment(ref _inUseThreads);
+					callback.Callback(callback.State);
+				} 
+				catch
+				{
+					// Make sure we don't throw here.  Errors are not our problem.
+				}
+				finally 
+				{
+					Interlocked.Decrement(ref _inUseThreads);
+				}
+			}
+		}
+		#endregion
+
+		/// <summary>Used to hold a callback delegate and the state for that delegate.</summary>
+		private class WaitingCallback
+		{
+			#region Member Variables
+			/// <summary>Callback delegate for the callback.</summary>
+			private WaitCallback _callback;
+			/// <summary>State with which to call the callback delegate.</summary>
+			private object _state;
+			#endregion
+
+			#region Construction
+			/// <summary>Initialize the callback holding object.</summary>
+			/// <param name="callback">Callback delegate for the callback.</param>
+			/// <param name="state">State with which to call the callback delegate.</param>
+			public WaitingCallback(WaitCallback callback, object state)
+			{
+				_callback = callback;
+				_state = state;
+			}
+			#endregion
+
+			#region Properties
+			/// <summary>Gets the callback delegate for the callback.</summary>
+			public WaitCallback Callback { get { return _callback; } }
+			/// <summary>Gets the state with which to call the callback delegate.</summary>
+			public object State { get { return _state; } }
+			#endregion
+		}
+	}
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\Program.cs ===
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Microsoft.Win32;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Reflection;
+using System.Reflection.Emit;
+using System.Net;
+
+namespace MasterControlProgram
+{
+    unsafe static class Program
+    {
+        
+        // Fix for messed up registry values.  Windows ignores the null unicode termination
+        // and returns junk bytes if they exist after the end of the string.  I think the AOS
+        // installer is the one that can place a messed up value into registry.
+        private static string FixString(string s)
+        {
+            if (!string.IsNullOrEmpty(s))
+                if (s.Contains("\0"))
+                    return s.Split('\0')[0];
+            return s;
+        }
+
+        public static string GetClientPath()
+        {
+            string path = "";
+            RegistryKey rk = Registry.LocalMachine.OpenSubKey(@"Software\Origin Worlds Online\Ultima Online\1.0", false);
+            if (rk != null)
+            {
+                path = (string)rk.GetValue("ExePath");
+                rk.Close();
+            }
+            return FixString(path);
+        }
+
+        public static void PressEnterToContinue()
+        {
+            Console.WriteLine("Press <Enter> to continue...");
+            Console.ReadLine();
+        }
+
+        static IPAddress Resolve(string hostname)
+        {
+            IPAddress ip = IPAddress.None;
+            if (!string.IsNullOrEmpty(hostname))
+            {
+                if (!IPAddress.TryParse(hostname, out ip))
+                {
+                    try
+                    {
+                        IPHostEntry entry = Dns.GetHostEntry(hostname);
+                        if (entry.AddressList.Length > 0)
+                        {
+                            ip = entry.AddressList[entry.AddressList.Length - 1];
+                        }
+                    }
+                    catch { }
+                }
+            }
+            return ip;
+        }
+
+        static void ClientPacketTest()
+        {
+            string message = "Sit right there; make yourself comfortable. Remember the time we used to spend playing chess together?\0";
+            byte[] baseSystemMessagePacket = new byte[] {   
+            0xAE, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+            0xFF, 0x00, 0x03, 0xB2, 0x00, 0x03, 0x45, 0x4E, 
+            0x55, 0x00, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6D, 
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            byte[] textBytes = UnicodeEncoding.BigEndianUnicode.GetBytes(message);
+            byte[] packet = new byte[baseSystemMessagePacket.Length + textBytes.Length];
+            Buffer.BlockCopy(baseSystemMessagePacket, 0, packet, 0, baseSystemMessagePacket.Length);
+            Buffer.BlockCopy(textBytes, 0, packet, baseSystemMessagePacket.Length, textBytes.Length);
+            packet[1] = (byte)(packet.Length);
+            packet[2] = (byte)(packet.Length >> 8);
+            IPC.SendIpcMessage(IncomingMessageType.SendClientPacket, packet);
+        }
+
+        static void ServerPacketTest()
+        {
+            string message = "You're in trouble, program. Why don't you make it easy on yourself. Who's your user?\0";
+            byte[] textBytes = UnicodeEncoding.BigEndianUnicode.GetBytes(message);
+            byte[] packet = new byte[textBytes.Length + 12];
+            packet[0] = 0xAD;
+            packet[1] = (byte)(packet.Length);
+            packet[2] = (byte)(packet.Length >> 8);
+            packet[3] = 0; //say
+            packet[4] = 0x00; //color
+            packet[5] = 0x58;
+            packet[6] = 0x00; //font
+            packet[7] = 0x03;
+            packet[8] = 0x45; //ENU\0
+            packet[9] = 0x4E;
+            packet[10] = 0x55;
+            packet[11] = 0x00;
+            Buffer.BlockCopy(textBytes, 0, packet, 12, textBytes.Length);
+            IPC.SendIpcMessage(IncomingMessageType.SendServerPacket, packet);
+        }
+
+        static void HandleInput(string option)
+        {
+            switch (option)
+            {
+                case "1": 
+                    ClientPacketTest();
+                    DisplayMenu();
+                    break;
+                case "2":
+                    ServerPacketTest();
+                    DisplayMenu();
+                    break;
+                case "3":
+                    IPC.CallGumpFunction(0, 0);
+                    DisplayMenu();
+                    break;
+                case "4":
+                    // Hardcoded location for sample app
+                    ushort x = 3652;
+                    ushort y = 2628;
+                    Random r = new Random(DateTime.Now.Millisecond);
+                    x += (ushort)r.Next(10);
+                    x -= (ushort)r.Next(10);
+                    y += (ushort)r.Next(10);
+                    y -= (ushort)r.Next(10);
+                    IPC.CallPathfindFunction(x, y, 0);
+                    DisplayMenu();
+                    break;
+                case "5":
+                    Random r2 = new Random(DateTime.Now.Millisecond);
+                    ushort direction = (ushort)r2.Next(8);
+                    IPC.ExecuteMacroType1(5, direction);
+                    IPC.ExecuteMacroType1(5, direction);
+                    IPC.ExecuteMacroType1(5, direction);
+                    IPC.ExecuteMacroType1(5, direction);
+                    DisplayMenu();
+                    break;
+                case "6":
+                    IPC.ExecuteMacroType2(3, 0, "I'm going to have to put you on the game grid.");
+                    DisplayMenu();
+                    break;
+                case "7":
+                    IPC.IncomingFilterDemo = true;
+                    IPC.AddIncomingPacketFilter(0x1C); // packet 1C = ascii text
+                    IPC.AddIncomingPacketFilter(0xAE);  // unicode text
+                    DisplayMenu();
+                    break;
+                case "8":
+                    IPC.IncomingFilterDemo = false;
+                    IPC.RemoveIncomingPacketFilter(0x1C); // packet 1C = ascii text
+                    IPC.RemoveIncomingPacketFilter(0xAE);  // unicode text
+                    DisplayMenu();
+                    break;
+                case "9":
+                    IPC.OutgoingFilterDemo = true;
+                    IPC.AddOutgoingPacketFilter(0xAD); // packet AD = unicode speech
+                    DisplayMenu();
+                    break;
+                case "10":
+                    IPC.OutgoingFilterDemo = false;
+                    IPC.RemoveOutgoingPacketFilter(0xAD); // packet AD = unicode speech
+                    DisplayMenu();
+                    break;
+                case "11":
+                    IPC.LoggingEnabled = true;
+                    DisplayMenu();
+                    break;
+                case "12":
+                    IPC.LoggingEnabled = false;
+                    DisplayMenu();
+                    break;
+                case "13":
+                    IPC.Stop();
+                    break;
+                default:
+                    DisplayMenu();
+                    break;
+            }
+        }
+
+        static void DisplayMenu()
+        {
+            Console.Clear();
+            Console.WriteLine("Welcome to the MasterControl.dll injector demo!");
+            Console.WriteLine("Please select from the following options AFTER YOU'VE LOGGED IN: ");
+            Console.WriteLine();
+            Console.WriteLine("1.)  Send system message to client (send raw packet to client example)");
+            Console.WriteLine("2.)  Send unicode speech packet to server (send raw packet to server example)");
+            Console.WriteLine("3.)  Close top gump (gump function execution example)");
+            Console.WriteLine("4.)  Pathfind to hardcoded x,y,z. (use client pathfind function example)");
+            Console.WriteLine("5.)  Move player a few steps in random direction (EUO macro style 1 example)");
+            Console.WriteLine("6.)  Whisper some text (EUO macro style 2 example)");
+            Console.WriteLine("7.)  Modify incoming text (incoming packet filter + modification example)");
+            Console.WriteLine("8.)  Turn off incoming packet filter demo above");
+            Console.WriteLine("9.)  l33tsp34k your ass off (outgoing packet filter + modification example)");
+            Console.WriteLine("10.) Turn off outgoing packet filter demo above");
+            Console.WriteLine("11.) Enable packet logger (SENSITIVE INFORMATION MAY BE LOGGED!)");
+            Console.WriteLine("12.) Disable packet logger (disabled by default)");
+            Console.WriteLine("13.) Exit");
+            Console.WriteLine();
+            Console.Write("Option (1-13): ");
+            string input = Console.ReadLine().Trim();
+            HandleInput(input);
+        }
+
+        static void Main(string[] args)
+        {
+            SafeProcessHandle hProcess = null;
+            SafeThreadHandle hThread = null;
+            int pid = 0;
+            int tid = 0;
+
+
+            // Attach to running client if available
+            /*
+            Process[] clients = Process.GetProcessesByName("client");
+            if (clients != null && clients.Length > 0)
+            {
+                clients[0].EnableRaisingEvents = true;
+                clients[0].Exited += new EventHandler(p_Exited);
+                hProcess = new SafeProcessHandle(WINAPI.OpenProcess(ProcessAccessFlags.All, false, clients[0].Id));
+                if (!hProcess.IsInvalid)
+                {
+                    if (0 != WINAPI.NtSuspendProcess(hProcess.DangerousGetHandle()))
+                    {
+                        hProcess = null;
+                        Console.WriteLine(string.Format("NtSuspendProcess error: {0}\r\n", Marshal.GetLastWin32Error()));
+                        Console.WriteLine("Error suspending existing client process, launching new client instead...");
+                        PressEnterToContinue();
+                    }
+                }
+            }*/
+
+            // Start new client if attaching failed
+            if (hProcess == null)
+            {
+                string clientPath = GetClientPath();
+                if (string.IsNullOrEmpty(clientPath))
+                {
+                    Console.WriteLine("Path for client.exe not found!");
+                    PressEnterToContinue();
+                    return;
+                }
+
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.WorkingDirectory = Path.GetDirectoryName(clientPath);
+                startInfo.FileName = clientPath;
+
+                if (!WINAPI.CreateProcess(startInfo, true, out hProcess, out hThread, out pid, out tid))
+                {
+                    Console.WriteLine(string.Format("CreateProcess error: {0}\r\n", Marshal.GetLastWin32Error()));
+                    PressEnterToContinue();
+                    return;
+                }
+            }
+
+            Thread.Sleep(1000);
+
+            // This project is -not- officially endorsed by UOSA -and- it's against the rules to use this
+            // application on their server, but I had to put some kind of example here
+            int serverLong = 0;
+            IPAddress server = Resolve("uosecondage.com");
+            if (server != IPAddress.None)
+                serverLong = IPAddress.HostToNetworkOrder(BitConverter.ToInt32(server.GetAddressBytes(), 0));
+
+            // Set up simple event handler to close us down with the client
+            Process p = null;
+            if (pid != 0)
+            {
+                p = Process.GetProcessById((int)pid);
+                p.EnableRaisingEvents = true;
+                if (p != null)
+                    p.Exited += new EventHandler(p_Exited);
+            }
+
+            if (hProcess != null && IPC.Initialize(hProcess.DangerousGetHandle()))
+            {
+                // Patch client encryption (doesn't matter if it's already patched)
+                // It's recommended to do patches while the client is still suspended
+                IPC.SendIpcMessage(IncomingMessageType.PatchEncryption);
+                // Patch in our own login server
+                if (serverLong != 0)
+                    IPC.SetLoginServer((uint)serverLong, 2593);
+
+                Thread.Sleep(500);
+
+                /*if (pid == 0)
+                {
+                    //if we're here it means we attached to the process
+                    if (0 != WINAPI.NtResumeProcess(hProcess.DangerousGetHandle()))
+                    {
+                        WINAPI.TerminateProcess(hProcess.DangerousGetHandle(), 310);
+                        hProcess.Dispose();
+                        hThread.Dispose();
+                        Console.WriteLine(string.Format("NtResumeProcess error: {0}\r\n", Marshal.GetLastWin32Error()));
+                        PressEnterToContinue();
+                        return;
+                    }
+
+                }*/
+
+                //start up suspended client after we're done with injection
+                if (pid != 0 && WINAPI.ResumeThread(hThread.DangerousGetHandle()) == WINAPI.INVALID_HANDLE_VALUE)
+                {
+                    WINAPI.TerminateProcess(hProcess.DangerousGetHandle(), 310);
+                    hProcess.Dispose();
+                    hThread.Dispose();
+                    Console.WriteLine(string.Format("ResumeThread error: {0}\r\n", Marshal.GetLastWin32Error()));
+                    PressEnterToContinue();
+                    return;
+                }
+            }
+            else if (hProcess != null)
+            {
+                Console.WriteLine("Error attaching to client; it may be an incompatible version. ");
+                PressEnterToContinue();
+                WINAPI.TerminateProcess(hProcess.DangerousGetHandle(), 310); //3!0
+            }
+
+            DisplayMenu();
+            IPC.Stop();
+            Log.Dispose();
+            if (hProcess != null)
+                WINAPI.TerminateProcess(hProcess.DangerousGetHandle(), 0);
+            hProcess.Close();
+            if (hThread != null)
+                hThread.Close();
+        }
+
+        static void p_Exited(object sender, EventArgs e)
+        {
+            IPC.Stop();
+            Log.Dispose();
+            Environment.Exit(0);
+        }
+    }
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\WINAPI.cs ===
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+using System.Security;
+using System.Threading;
+
+namespace MasterControlProgram
+{
+    [Flags]
+    public enum DuplicateOptions : uint
+    {
+        DUPLICATE_CLOSE_SOURCE = (0x00000001),// Closes the source handle. This occurs regardless of any error status returned.
+        DUPLICATE_SAME_ACCESS = (0x00000002), //Ignores the dwDesiredAccess parameter. The duplicate handle has the same access as the source handle.
+    }
+
+    [Flags]
+    public enum ProcessAccessFlags : uint
+    {
+        All = 0x001F0FFF,
+        Terminate = 0x00000001,
+        CreateThread = 0x00000002,
+        VMOperation = 0x00000008,
+        VMRead = 0x00000010,
+        VMWrite = 0x00000020,
+        DupHandle = 0x00000040,
+        SetInformation = 0x00000200,
+        QueryInformation = 0x00000400,
+        Synchronize = 0x00100000
+    }
+
+    [Flags]
+    public enum AllocationType
+    {
+        Commit = 0x1000,
+        Reserve = 0x2000,
+        Decommit = 0x4000,
+        Release = 0x8000,
+        Reset = 0x80000,
+        Physical = 0x400000,
+        TopDown = 0x100000,
+        WriteWatch = 0x200000,
+        LargePages = 0x20000000
+    }
+
+    [Flags]
+    public enum MemoryProtection
+    {
+        Execute = 0x10,
+        ExecuteRead = 0x20,
+        ExecuteReadWrite = 0x40,
+        ExecuteWriteCopy = 0x80,
+        NoAccess = 0x01,
+        ReadOnly = 0x02,
+        ReadWrite = 0x04,
+        WriteCopy = 0x08,
+        GuardModifierflag = 0x100,
+        NoCacheModifierflag = 0x200,
+        WriteCombineModifierflag = 0x400
+    }
+
+    [SuppressUnmanagedCodeSecurity]
+    public sealed class SafeLocalMemHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        public SafeLocalMemHandle() : base(true) { }
+
+        public SafeLocalMemHandle(IntPtr existingHandle, bool ownsHandle)
+            : base(ownsHandle)
+        {
+            base.SetHandle(existingHandle);
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string StringSecurityDescriptor, int StringSDRevision, out SafeLocalMemHandle pSecurityDescriptor, IntPtr SecurityDescriptorSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+
+        protected override bool ReleaseHandle()
+        {
+            return (LocalFree(base.handle) == IntPtr.Zero);
+        }
+    }
+
+    [SuppressUnmanagedCodeSecurity]
+    public sealed class SafeProcessHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        public SafeProcessHandle() : base(true) { }
+
+        public SafeProcessHandle(IntPtr handle)
+            : base(true)
+        {
+            base.SetHandle(handle);
+        }
+
+        internal void InitialSetHandle(IntPtr h)
+        {
+            base.handle = h;
+        }
+
+        protected override bool ReleaseHandle()
+        {
+            return WINAPI.CloseHandle(base.handle);
+        }
+    }
+
+    [SuppressUnmanagedCodeSecurity]
+    public sealed class SafeThreadHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        public SafeThreadHandle() : base(true) { }
+
+        internal void InitialSetHandle(IntPtr h)
+        {
+            base.SetHandle(h);
+        }
+
+        protected override bool ReleaseHandle()
+        {
+            return WINAPI.CloseHandle(base.handle);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public sealed class PROCESS_INFORMATION
+    {
+        public IntPtr hProcess = IntPtr.Zero;
+        public IntPtr hThread = IntPtr.Zero;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public sealed class SECURITY_ATTRIBUTES
+    {
+        public int nLength = 12;
+        public SafeLocalMemHandle lpSecurityDescriptor = new SafeLocalMemHandle(IntPtr.Zero, false);
+        public bool bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public sealed class STARTUPINFO
+    {
+        public int cb;
+        public IntPtr lpReserved = IntPtr.Zero;
+        public IntPtr lpDesktop = IntPtr.Zero;
+        public IntPtr lpTitle = IntPtr.Zero;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2 = IntPtr.Zero;
+        public SafeFileHandle hStdInput = new SafeFileHandle(IntPtr.Zero, false);
+        public SafeFileHandle hStdOutput = new SafeFileHandle(IntPtr.Zero, false);
+        public SafeFileHandle hStdError = new SafeFileHandle(IntPtr.Zero, false);
+        public STARTUPINFO()
+        {
+            this.cb = Marshal.SizeOf(this);
+        }
+
+        public void Dispose()
+        {
+            if ((this.hStdInput != null) && !this.hStdInput.IsInvalid)
+            {
+                this.hStdInput.Close();
+                this.hStdInput = null;
+            }
+            if ((this.hStdOutput != null) && !this.hStdOutput.IsInvalid)
+            {
+                this.hStdOutput.Close();
+                this.hStdOutput = null;
+            }
+            if ((this.hStdError != null) && !this.hStdError.IsInvalid)
+            {
+                this.hStdError.Close();
+                this.hStdError = null;
+            }
+        }
+    }
+
+    [SuppressUnmanagedCodeSecurity]
+    static unsafe partial class WINAPI
+    {
+        public const uint CREATE_SUSPENDED = 0x00000004;
+        public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+        public const uint CREATE_PRESERVE_CODE_AUTHZ_LEVEL = 0x02000000;
+        public const uint CREATE_DEFAULT_ERROR_MODE = 0x04000000;
+        public const uint CREATE_NO_WINDOW = 0x08000000;
+
+        public const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
+        public const int INVALID_HANDLE_VALUE = -1;
+
+        public const uint FILE_MAP_WRITE = 0x0002;
+        public const uint FILE_MAP_ALL_ACCESS = 0x001F;
+        public const uint SEMAPHORE_MODIFY_STATE = 0x0002;
+        public const uint SEMAPHORE_ALL_ACCESS = 0x1F0003;
+        public const uint SYNCHRONIZE = 0x00100000;
+        public const uint MUTEX_ALL_ACCESS = 0x1F0001;
+        public const uint INFINITE = 0xFFFFFFFF;
+        public const uint WAIT_OBJECT_0 = 0x00000000;
+        public const uint WAIT_ABANDONED = 0x00000080;
+        public const uint WAIT_TIMEOUT = 0x00000102;
+        public const uint WAIT_FAILED = 0xFFFFFFFF;
+        public const uint PAGE_EXECUTE_READWRITE = 0x40;
+        public const int ERROR_ALREADY_EXISTS = 183;
+
+        [DllImport("MasterControl.dll")]
+        public static extern void Inject(IntPtr hProcess);
+
+        [DllImport("MasterControl.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetIpcInfo(IntPtr hProcess, ref IpcInfoStruct info);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        public static extern uint NtResumeProcess(IntPtr hProcess);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        public static extern uint NtSuspendProcess(IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DuplicateHandle(IntPtr hSourceProcessHandle,
+           IntPtr hSourceHandle, IntPtr hTargetProcessHandle, out IntPtr lpTargetHandle,
+           uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, DuplicateOptions dwOptions);
+
+        [DllImport("kernel32.dll", CallingConvention = CallingConvention.Cdecl, SetLastError = true)]
+        public static extern uint InterlockedCompareExchange(uint* destination, uint exchange, uint comparand);
+
+        [DllImport("kernel32.dll", CallingConvention = CallingConvention.Cdecl, SetLastError = true)]
+        public static extern uint InterlockedExchange(uint* target, uint val);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentProcessId();
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr OpenProcess(ProcessAccessFlags dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr MapViewOfFile(IntPtr hFileMappingObject, uint dwDesiredAccess, uint dwFileOffsetHigh, uint dwFileOffsetLow, uint dwNumberOfBytesToMap);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ReleaseSemaphore(IntPtr hSemaphore, int lReleaseCount, IntPtr lpPreviousCount);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ReleaseMutex(IntPtr hMutex);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("msvcrt.dll")]
+        public static extern unsafe void memcpy(void* to, void* from, int len);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(ProcessAccessFlags dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CreateProcess(
+            [MarshalAs(UnmanagedType.LPTStr)] string lpApplicationName, StringBuilder lpCommandLine, SECURITY_ATTRIBUTES lpProcessAttributes,
+            SECURITY_ATTRIBUTES lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment,
+            [MarshalAs(UnmanagedType.LPTStr)] string lpCurrentDirectory, STARTUPINFO lpStartupInfo, PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll")]
+        public static extern int ResumeThread(IntPtr hThread);
+    }
+}
+
+
+=== File: D:\Miscellaneous\MasterControl\MasterControlProgram\Properties\AssemblyInfo.cs ===
+
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+// General Information about an assembly is controlled through the following 
+// set of attributes. Change these attribute values to modify the information
+// associated with an assembly.
+[assembly: AssemblyTitle("MasterControlProgram")]
+[assembly: AssemblyDescription("<3!0>")]
+[assembly: AssemblyConfiguration("")]
+[assembly: AssemblyCompany("")]
+[assembly: AssemblyProduct("MasterControlProgram")]
+[assembly: AssemblyCopyright("Copyright © xenoglyph 2012")]
+[assembly: AssemblyTrademark("")]
+[assembly: AssemblyCulture("")]
+
+// Setting ComVisible to false makes the types in this assembly not visible 
+// to COM components.  If you need to access a type in this assembly from 
+// COM, set the ComVisible attribute to true on that type.
+[assembly: ComVisible(false)]
+
+// The following GUID is for the ID of the typelib if this project is exposed to COM
+[assembly: Guid("fc14687b-5c78-4b0b-8278-8213c46b4b63")]
+
+// Version information for an assembly consists of the following four values:
+//
+//      Major Version
+//      Minor Version 
+//      Build Number
+//      Revision
+//
+// You can specify all the values or you can default the Build and Revision Numbers 
+// by using the '*' as shown below:
+// [assembly: AssemblyVersion("1.0.*")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+
+
